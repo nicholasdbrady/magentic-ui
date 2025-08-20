@@ -981,6 +981,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         """
         try:
             assert self._page is not None
+            await self._playwright_controller._ensure_page_ready(self._page)  # type: ignore
             assert (
                 await self._playwright_controller.get_interactive_rects(self._page)
                 is not None
@@ -1426,6 +1427,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         if new_page_tentative is not None:
             new_url = new_page_tentative.url
             self._page = new_page_tentative
+            # Ensure the new page is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             ret, approved = await self._check_url_and_generate_msg(new_url)
             if not approved:
@@ -1460,6 +1463,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         if new_page_tentative is not None:
             new_url = new_page_tentative.url
             self._page = new_page_tentative
+            # Ensure the new page is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             ret, approved = await self._check_url_and_generate_msg(new_url)
             if not approved:
@@ -1568,6 +1573,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             if not approved:
                 return ret
             self._page = new_page_tentative
+            # Ensure the new page is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
 
         return action_description
@@ -1581,6 +1588,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         action_description = f"I created a new tab and navigated to '{url}'."
         new_page = await self._playwright_controller.create_new_tab(self._context, url)
         self._page = new_page
+        # Ensure the new page is visible and active
+        await self._page.bring_to_front()
         self._prior_metadata_hash = None
         return action_description
 
@@ -1593,6 +1602,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 self._context, tab_index
             )
             self._page = new_page
+            # Ensure the switched tab is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             return f"I switched to tab {tab_index}."
         except (ValueError, TypeError) as e:
@@ -1607,6 +1618,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 self._context, tab_index
             )
             self._page = new_page
+            # Ensure the new active tab is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             return f"I closed tab {tab_index} and switched to an adjacent tab."
         except (ValueError, TypeError) as e:
@@ -2038,8 +2051,10 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
     def from_config(cls, config: WebSurferConfig) -> Self:
         return cls._from_config(config)
 
-    async def save_state(self) -> Mapping[str, Any]:
+    async def save_state(self, save_browser: bool = True) -> Mapping[str, Any]:
         """Save the current state of the WebSurfer.
+        Args:
+            save_browser (bool): Whether to save the browser state. Defaults to True.
 
         Returns:
             A dictionary containing the chat history and browser state
@@ -2053,8 +2068,11 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             return state.model_dump()
 
         assert self._context is not None
-        # Get the browser state and convert it to a dict
-        browser_state = await save_browser_state(self._context, self._page)
+
+        browser_state = None
+        if save_browser:
+            # Get the browser state and convert it to a dict
+            browser_state = await save_browser_state(self._context, self._page)
 
         # Create and return the WebSurfer state
         state = WebSurferState(
@@ -2063,8 +2081,11 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         )
         return state.model_dump()
 
-    async def load_state(self, state: Mapping[str, Any]) -> None:
-        """Load a previously saved state.
+    async def load_state(
+        self, state: Mapping[str, Any], load_browser: bool = True
+    ) -> None:
+        """
+        Load a previously saved state.
 
         Args:
             state: Dictionary containing the state to load
@@ -2075,8 +2096,9 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         # Update the chat history
         self._chat_history = web_surfer_state.chat_history
 
-        # Load the browser state if it exists
-        if web_surfer_state.browser_state is not None:
+        # Load the browser state if it exists and load_browser is True
+        if load_browser and web_surfer_state.browser_state is not None:
+            await self.lazy_init()
             assert self._context is not None
             await load_browser_state(self._context, web_surfer_state.browser_state)
 

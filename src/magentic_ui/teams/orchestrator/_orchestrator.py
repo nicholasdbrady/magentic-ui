@@ -42,7 +42,7 @@ from autogen_agentchat.teams._group_chat._base_group_chat_manager import (
 from autogen_agentchat.state import BaseGroupChatManagerState
 from ...learning.memory_provider import MemoryControllerProvider
 
-from ...types import HumanInputFormat, Plan
+from ...types import HumanInputFormat, Plan, SentinelPlanStep
 from ...utils import dict_to_str, thread_to_context
 from ...tools.bing_search import get_bing_search_results
 from ...teams.orchestrator.orchestrator_config import OrchestratorConfig
@@ -58,6 +58,10 @@ from ._prompts import (
     INSTRUCTION_AGENT_FORMAT,
     validate_ledger_json,
     validate_plan_json,
+)
+from ._sentinel_prompts import (
+    ORCHESTRATOR_SENTINEL_CONDITION_CHECK_PROMPT,
+    validate_sentinel_condition_check_json,
 )
 from ._utils import is_accepted_str, extract_json_from_string
 from loguru import logger as trace_logger
@@ -93,6 +97,8 @@ class OrchestratorState(BaseGroupChatManagerState):
         self.is_paused = False
         self.n_replans = 0
 
+    # resets most of the orchestrator's state but keeps message history
+    # to allow for follow up questions
     def reset_for_followup(self) -> None:
         self.task = ""
         self.plan_str = ""
@@ -281,6 +287,14 @@ class Orchestrator(BaseGroupChatManager):
         additional_instructions = ""
         if self._config.autonomous_execution:
             additional_instructions = "VERY IMPORTANT: The next agent name cannot be the user or user_proxy, use any other agent."
+
+        # Determine step_type based on the current step
+        step_type = "PlanStep"
+        if self._config.sentinel_tasks and isinstance(
+            self._state.plan[step_index], SentinelPlanStep
+        ):
+            step_type = "SentinelPlanStep"
+
         return get_orchestrator_progress_ledger_prompt(
             self._config.sentinel_tasks
         ).format(
@@ -289,6 +303,7 @@ class Orchestrator(BaseGroupChatManager):
             step_index=step_index,
             step_title=self._state.plan[step_index].title,
             step_details=self._state.plan[step_index].details,
+            step_type=step_type,
             agent_name=self._state.plan[step_index].agent_name,
             team=team,
             names=", ".join(names),
@@ -303,6 +318,7 @@ class Orchestrator(BaseGroupChatManager):
 
     def get_agent_instruction(self, instruction: str, agent_name: str) -> str:
         assert self._state.plan is not None
+
         return INSTRUCTION_AGENT_FORMAT.format(
             step_index=self._state.current_step_idx + 1,
             step_title=self._state.plan[self._state.current_step_idx].title,
@@ -342,13 +358,22 @@ class Orchestrator(BaseGroupChatManager):
         content: str,
         internal: bool = False,
         metadata: Optional[Dict[str, str]] = None,
+        entire_message: Optional[BaseChatMessage] = None,
     ) -> None:
+        if entire_message is not None:
+            await self.publish_message(
+                GroupChatMessage(message=entire_message),
+                topic_id=DefaultTopicId(type=self._output_topic_type),
+            )
+            await self._output_message_queue.put(entire_message)
+            return
         internal_str = "yes" if internal else "no"
         message = TextMessage(
             content=content,
             source=self._name,
             metadata=metadata or {"internal": internal_str},
         )
+
         await self.publish_message(
             GroupChatMessage(message=message),
             topic_id=DefaultTopicId(type=self._output_topic_type),
@@ -369,11 +394,14 @@ class Orchestrator(BaseGroupChatManager):
             source=self._name,
             metadata=metadata or {"internal": internal_str},
         )
+
         await self.publish_message(
             GroupChatMessage(message=message),
             topic_id=DefaultTopicId(type=self._output_topic_type),
         )
+
         await self._output_message_queue.put(message)
+
         await self.publish_message(
             GroupChatAgentResponse(agent_response=Response(chat_message=message)),
             topic_id=DefaultTopicId(type=self._group_topic_type),
@@ -389,6 +417,7 @@ class Orchestrator(BaseGroupChatManager):
             return
 
         next_speaker_topic_type = self._participant_name_to_topic_type[next_speaker]
+
         await self.publish_message(
             GroupChatRequestPublish(),
             topic_id=DefaultTopicId(type=next_speaker_topic_type),
@@ -437,7 +466,7 @@ class Orchestrator(BaseGroupChatManager):
                     else:
                         exception_message = "Validation failed for JSON response, retrying. You must return a valid JSON object parsed from the response."
                         await self._log_message(
-                            f"Validation failed for JSON response, retrying ({retries}/{self._config.max_json_retries})"
+                            f"Validation failed for JSON response: {json_response}, retrying ({retries}/{self._config.max_json_retries})"
                         )
                 except json.JSONDecodeError as e:
                     json_response = extract_json_from_string(response.content)
@@ -720,7 +749,9 @@ class Orchestrator(BaseGroupChatManager):
 
                 if not self._config.cooperative_planning:
                     self._state.in_planning_mode = False
-                    await self._orchestrate_first_step(cancellation_token)
+                    await self._orchestrate_step_execution(
+                        cancellation_token, first_step=True
+                    )
                     return
                 else:
                     await self._request_next_speaker(
@@ -736,7 +767,9 @@ class Orchestrator(BaseGroupChatManager):
                     last_user_message.content
                 ):
                     self._state.in_planning_mode = False
-                    await self._orchestrate_first_step(cancellation_token)
+                    await self._orchestrate_step_execution(
+                        cancellation_token, first_step=True
+                    )
                     return
 
             # assume the task is the last user message
@@ -792,7 +825,9 @@ class Orchestrator(BaseGroupChatManager):
                     self._state.plan_str = str(user_plan)
                 # switch to execution mode
                 self._state.in_planning_mode = False
-                await self._orchestrate_first_step(cancellation_token)
+                await self._orchestrate_step_execution(
+                    cancellation_token, first_step=True
+                )
                 return
             # user did not accept the plan yet
             else:
@@ -878,108 +913,30 @@ class Orchestrator(BaseGroupChatManager):
                 cancellation_token=cancellation_token,
             )
             self._state.in_planning_mode = False
-            await self._orchestrate_first_step(cancellation_token)
-
-    async def _orchestrate_first_step(
-        self, cancellation_token: CancellationToken
-    ) -> None:
-        # remove all messages from the message thread that are not from the user
-        self._state.message_history = [
-            m
-            for m in self._state.message_history
-            if m.source not in ["user", self._user_agent_topic]
-        ]
-
-        ledger_message = TextMessage(
-            content=self._get_task_ledger_full_prompt(
-                self._state.task, self._team_description, self._state.plan_str
-            ),
-            source=self._name,
-        )
-        # add the ledger message to the message thread internally
-        self._state.message_history.append(ledger_message)
-        await self._log_message_agentchat(ledger_message.content, internal=True)
-
-        # check if the plan is empty, complete, or we have reached the max turns
-        if (
-            (not isinstance(self._state.plan, Plan) or len(self._state.plan) == 0)
-            or (self._state.current_step_idx >= len(self._state.plan))
-            or (
-                self._config.max_turns is not None
-                and self._state.n_rounds > self._config.max_turns
-            )
-        ):
-            await self._prepare_final_answer("Max rounds reached.", cancellation_token)
-            return
-        self._state.n_rounds += 1
-        context = self._thread_to_context()
-        # Creat the progress ledger
-
-        progress_ledger_prompt = self._get_progress_ledger_prompt(
-            self._state.task,
-            self._state.plan_str,
-            self._state.current_step_idx,
-            self._team_description,
-            self._agent_execution_names,
-        )
-        context.append(UserMessage(content=progress_ledger_prompt, source=self._name))
-
-        progress_ledger = await self._get_json_response(
-            context, self._validate_ledger_json, cancellation_token
-        )
-        if self._state.is_paused:
-            # let user speak next if paused
-            await self._request_next_speaker(self._user_agent_topic, cancellation_token)
-            return
-        assert progress_ledger is not None
-
-        await self._log_message_agentchat(dict_to_str(progress_ledger), internal=True)
-
-        # Broadcast the next step
-        new_instruction = self.get_agent_instruction(
-            progress_ledger["instruction_or_question"]["answer"],
-            progress_ledger["instruction_or_question"]["agent_name"],
-        )
-
-        message_to_send = TextMessage(
-            content=new_instruction, source=self._name, metadata={"internal": "yes"}
-        )
-        self._state.message_history.append(message_to_send)  # My copy
-
-        await self._publish_group_chat_message(
-            message_to_send.content, cancellation_token, internal=True
-        )
-        json_step_execution = {
-            "title": self._state.plan[self._state.current_step_idx].title,
-            "index": self._state.current_step_idx,
-            "details": self._state.plan[self._state.current_step_idx].details,
-            "agent_name": progress_ledger["instruction_or_question"]["agent_name"],
-            "instruction": progress_ledger["instruction_or_question"]["answer"],
-            "progress_summary": progress_ledger["progress_summary"],
-            "plan_length": len(self._state.plan),
-        }
-        await self._log_message_agentchat(
-            json.dumps(json_step_execution),
-            metadata={"internal": "no", "type": "step_execution"},
-        )
-        # Request that the step be completed
-        valid_next_speaker: bool = False
-        next_speaker = progress_ledger["instruction_or_question"]["agent_name"]
-        for participant_name in self._agent_execution_names:
-            if participant_name == next_speaker:
-                await self._request_next_speaker(next_speaker, cancellation_token)
-                valid_next_speaker = True
-                break
-        if not valid_next_speaker:
-            raise ValueError(
-                f"Invalid next speaker: {next_speaker} from the ledger, participants are: {self._agent_execution_names}"
-            )
+            await self._orchestrate_step_execution(cancellation_token, first_step=True)
 
     async def _orchestrate_step_execution(
-        self, cancellation_token: CancellationToken
+        self, cancellation_token: CancellationToken, first_step: bool = False
     ) -> None:
         # Execution stage
-        # Check if we reached the maximum number of rounds
+        if first_step:
+            # remove all messages from the message thread that are not from the user
+            self._state.message_history = [
+                m
+                for m in self._state.message_history
+                if m.source not in ["user", self._user_agent_topic]
+            ]
+
+            ledger_message = TextMessage(
+                content=self._get_task_ledger_full_prompt(
+                    self._state.task, self._team_description, self._state.plan_str
+                ),
+                source=self._name,
+            )
+            # add the ledger message to the message thread internally
+            self._state.message_history.append(ledger_message)
+            await self._log_message_agentchat(ledger_message.content, internal=True)
+
         assert self._state.plan is not None
         if self._state.current_step_idx >= len(self._state.plan) or (
             self._config.max_turns is not None
@@ -1011,33 +968,33 @@ class Orchestrator(BaseGroupChatManager):
         assert progress_ledger is not None
         # log the progress ledger
         await self._log_message_agentchat(dict_to_str(progress_ledger), internal=True)
+        if not first_step:
+            # Check for replans
+            need_to_replan = progress_ledger["need_to_replan"]["answer"]
+            replan_reason = progress_ledger["need_to_replan"]["reason"]
 
-        # Check for replans
-        need_to_replan = progress_ledger["need_to_replan"]["answer"]
-        replan_reason = progress_ledger["need_to_replan"]["reason"]
-
-        if need_to_replan and self._config.allow_for_replans:
-            # Replan
-            if self._config.max_replans is None:
-                await self._replan(replan_reason, cancellation_token)
-            elif self._state.n_replans < self._config.max_replans:
-                self._state.n_replans += 1
-                await self._replan(replan_reason, cancellation_token)
-                return
-            else:
+            if need_to_replan and self._config.allow_for_replans:
+                # Replan
+                if self._config.max_replans is None:
+                    await self._replan(replan_reason, cancellation_token)
+                elif self._state.n_replans < self._config.max_replans:
+                    self._state.n_replans += 1
+                    await self._replan(replan_reason, cancellation_token)
+                    return
+                else:
+                    await self._prepare_final_answer(
+                        f"We need to replan but max replan attempts reached: {replan_reason}.",
+                        cancellation_token,
+                    )
+                    return
+            elif need_to_replan:
                 await self._prepare_final_answer(
-                    f"We need to replan but max replan attempts reached: {replan_reason}.",
+                    f"The current plan failed to complete the task, we need a new plan to continue. {replan_reason}",
                     cancellation_token,
                 )
                 return
-        elif need_to_replan:
-            await self._prepare_final_answer(
-                f"The current plan failed to complete the task, we need a new plan to continue. {replan_reason}",
-                cancellation_token,
-            )
-            return
-        if progress_ledger["is_current_step_complete"]["answer"]:
-            self._state.current_step_idx += 1
+            if progress_ledger["is_current_step_complete"]["answer"]:
+                self._state.current_step_idx += 1
 
         if progress_ledger["progress_summary"] != "":
             self._state.information_collected += (
@@ -1051,19 +1008,26 @@ class Orchestrator(BaseGroupChatManager):
             )
             return
 
-        # Broadcast the next step
-        new_instruction = self.get_agent_instruction(
-            progress_ledger["instruction_or_question"]["answer"],
-            progress_ledger["instruction_or_question"]["agent_name"],
+        current_step = self._state.plan[self._state.current_step_idx]
+        is_sentinel_step = (
+            isinstance(current_step, SentinelPlanStep) and self._config.sentinel_tasks
         )
-        message_to_send = TextMessage(
-            content=new_instruction, source=self._name, metadata={"internal": "yes"}
-        )
-        self._state.message_history.append(message_to_send)  # My copy
 
-        await self._publish_group_chat_message(
-            message_to_send.content, cancellation_token, internal=True
-        )
+        # Broadcast the next step
+        if not is_sentinel_step:
+            new_instruction = self.get_agent_instruction(
+                progress_ledger["instruction_or_question"]["answer"],
+                progress_ledger["instruction_or_question"]["agent_name"],
+            )
+            message_to_send = TextMessage(
+                content=new_instruction, source=self._name, metadata={"internal": "yes"}
+            )
+            self._state.message_history.append(message_to_send)  # My copy
+
+            await self._publish_group_chat_message(
+                message_to_send.content, cancellation_token, internal=True
+            )
+        # TODO: add sentinel step execution here if sentinel step
         json_step_execution = {
             "title": self._state.plan[self._state.current_step_idx].title,
             "index": self._state.current_step_idx,
@@ -1079,17 +1043,28 @@ class Orchestrator(BaseGroupChatManager):
         )
 
         # Request that the step be completed
-        valid_next_speaker: bool = False
-        next_speaker = progress_ledger["instruction_or_question"]["agent_name"]
-        for participant_name in self._agent_execution_names:
-            if participant_name == next_speaker:
-                await self._request_next_speaker(next_speaker, cancellation_token)
-                valid_next_speaker = True
-                break
-        if not valid_next_speaker:
-            raise ValueError(
-                f"Invalid next speaker: {next_speaker} from the ledger, participants are: {self._agent_execution_names}"
+        if not is_sentinel_step:
+            valid_next_speaker: bool = False
+            next_speaker = progress_ledger["instruction_or_question"]["agent_name"]
+            for participant_name in self._agent_execution_names:
+                if participant_name == next_speaker:
+                    await self._request_next_speaker(next_speaker, cancellation_token)
+                    valid_next_speaker = True
+                    break
+            if not valid_next_speaker:
+                raise ValueError(
+                    f"Invalid next speaker: {next_speaker} from the ledger, participants are: {self._agent_execution_names}"
+                )
+        else:
+            assert isinstance(current_step, SentinelPlanStep)
+            await self._log_message_agentchat(
+                f"Executing sentinel step: {current_step.title}",
+                metadata={"internal": "no", "type": "sentinel_start"},
             )
+            await self._execute_sentinel_step(current_step, cancellation_token)
+            # assume sentinel step is completed
+            self._state.current_step_idx += 1  # moves to the next step
+            await self._orchestrate_step(cancellation_token)
 
     async def _replan(self, reason: str, cancellation_token: CancellationToken) -> None:
         # Let's create a new plan
@@ -1107,7 +1082,10 @@ class Orchestrator(BaseGroupChatManager):
             else []
         )
         completed_plan_str = "\n".join(
-            [f"COMPLETED STEP {i+1}: {step}" for i, step in enumerate(completed_steps)]
+            [
+                f"COMPLETED STEP {i + 1}: {step}"
+                for i, step in enumerate(completed_steps)
+            ]
         )
 
         # Add completed steps info to replan prompt
@@ -1154,7 +1132,7 @@ class Orchestrator(BaseGroupChatManager):
             await self._request_next_speaker(self._user_agent_topic, cancellation_token)
         else:
             self._state.in_planning_mode = False
-            await self._orchestrate_first_step(cancellation_token)
+            await self._orchestrate_step_execution(cancellation_token, first_step=True)
 
     async def _prepare_final_answer(
         self,
@@ -1231,6 +1209,7 @@ class Orchestrator(BaseGroupChatManager):
         )
         context_messages: List[LLMMessage] = []
         date_today = datetime.now().strftime("%d %B, %Y")
+
         if self._state.in_planning_mode:
             context_messages.append(
                 SystemMessage(content=self._get_system_message_planning())
@@ -1255,6 +1234,7 @@ class Orchestrator(BaseGroupChatManager):
                     messages=chat_messages, agent_name=self._name, is_multimodal=False
                 )
             )
+
         return context_messages
 
     async def save_state(self) -> Mapping[str, Any]:
@@ -1301,3 +1281,183 @@ class Orchestrator(BaseGroupChatManager):
 
         # Update the state
         self._state = new_state
+
+    async def _execute_sentinel_step(
+        self, step: "SentinelPlanStep", cancellation_token: CancellationToken
+    ) -> None:
+        """Execute a sentinel step with periodic checks of the specified condition.
+
+        Args:
+            step: The sentinel step to execute
+            cancellation_token: Cancellation token to stop execution
+        """
+        # Number of times to iterate over the condition
+        iteration = 0
+
+        # The agent tasked with this sentinel step
+        agent_name = step.agent_name
+
+        # Validate agent exists
+        valid_agent = False
+        for participant_name in self._agent_execution_names:
+            if participant_name == agent_name:
+                valid_agent = True
+                break
+        if not valid_agent:
+            raise ValueError(
+                f"Invalid agent: {agent_name}, participants are: {self._agent_execution_names}"
+            )
+
+        # Get the agent container
+        agent_container = await self._runtime.try_get_underlying_agent_instance(
+            AgentId(
+                type=self._participant_name_to_topic_type[agent_name],
+                key=self.id.key,
+            )
+        )
+
+        if agent_container._agent is not None:  # type: ignore
+            agent = agent_container._agent  # type: ignore
+        else:
+            raise ValueError(
+                f"Agent container for {agent_name} does not have a valid agent instance"
+            )
+
+        # gets the instruction that the agent will perform
+        step_details = step.details
+
+        # saves the initial state of the agent
+        # TODO we might want to move this inside the while loop
+        # and only save the state when iteration == 1
+        initial_agent_state = None
+        can_save_load = hasattr(agent, "save_state") and hasattr(agent, "load_state")  # type: ignore
+        if can_save_load:
+            initial_agent_state = await agent.save_state()  # type: ignore
+
+        while True:
+            try:
+                # Check if task is cancelled
+                if cancellation_token.is_cancelled():
+                    return
+
+                # increases iteration count
+                iteration += 1
+
+                # loads the initial state of the agent
+                if can_save_load and initial_agent_state is not None:
+                    if agent_name == self._web_agent_topic:
+                        await agent.load_state(initial_agent_state, load_browser=False)  # type: ignore
+                    else:
+                        await agent.load_state(initial_agent_state)  # type: ignore
+
+                # creates a BaseChatMessage instance and turns into a sequence
+                # TODO: provide more context about the task to agent
+                sentinel_task_agent_message = [
+                    TextMessage(
+                        content=step_details,
+                        source="user",
+                    )
+                ]
+
+                # uses streaming to get ALL responses
+                final_response: Optional[Response] = None
+                async for response in agent.on_messages_stream(  # type: ignore
+                    sentinel_task_agent_message, cancellation_token
+                ):
+                    if isinstance(response, Response):
+                        # logs each step of the process
+                        if response.chat_message:
+                            chat_content = response.chat_message
+                            await self._log_message_agentchat(
+                                content="dummy",
+                                entire_message=chat_content,
+                            )
+
+                        final_response = response
+                    elif isinstance(response, TextMessage) or isinstance(
+                        response, MultiModalMessage
+                    ):
+                        await self._log_message_agentchat(
+                            content="not used",
+                            entire_message=response,
+                        )
+                # this is a MultiModalMessage or TextMessage object
+                assert (
+                    final_response is not None
+                    and final_response.chat_message is not None
+                )
+                last_agent_message = final_response.chat_message
+
+                # Check if condition is met
+                condition_met = None
+                reason = None
+                # For integer condition, check if we've reached the required iterations
+                if isinstance(step.condition, int):
+                    condition_met = iteration >= step.condition
+
+                # For string condition, check with an LLM if the condition is met
+                else:
+                    # initializes empty context and adds the last message in the system
+                    context: List[LLMMessage] = []
+                    assert isinstance(
+                        last_agent_message, MultiModalMessage | TextMessage
+                    )
+                    context.append(
+                        UserMessage(
+                            content=last_agent_message.content,
+                            source=agent_name,
+                        )
+                    )
+
+                    # gets the structured prompt for the condition check
+                    step_description: str = f"Step Title {step.title}, Step Instruction {step.details}, Step Condition {step.condition}, Agent Name {agent_name}"
+                    condition_check_message = UserMessage(
+                        content=ORCHESTRATOR_SENTINEL_CONDITION_CHECK_PROMPT.format(
+                            step_description=step_description,
+                            condition=step.condition,
+                        ),
+                        source=self._name,
+                    )
+                    context.append(condition_check_message)
+
+                    # sends the condition check (the 2 messages) to an LLM
+                    response_json = await self._get_json_response(
+                        context,
+                        validate_sentinel_condition_check_json,
+                        cancellation_token,
+                    )
+                    assert isinstance(response_json, dict)
+                    condition_met = response_json.get("condition_met", None)
+                    reason = response_json.get("reason", None)
+                # If condition met, return to complete the step
+
+                if condition_met:
+                    log_msg = f"Condition satisfied: {reason}."
+                    await self._log_message_agentchat(
+                        log_msg,
+                        metadata={"internal": "no", "type": "sentinel_complete"},
+                    )
+                    # inform orchestrator that the step is completed
+                    self._state.message_history.append(
+                        TextMessage(
+                            content=f"Sentinel step '{step.title}' completed successfully. Reason: {reason}",
+                            source="user",
+                        )
+                    )
+                    return
+                else:
+                    # Sleep before the next check
+                    await self._log_message_agentchat(
+                        f"(Check #{iteration}) Condition not satisfied: {reason} \n Sleeping for {step.sleep_duration}s before next check.",
+                        metadata={"internal": "no", "type": "sentinel_sleep"},
+                    )
+                    await asyncio.sleep(step.sleep_duration)
+
+            # exception
+            except asyncio.CancelledError:
+                # Handle cancellation
+                return
+            except Exception as e:
+                # Log the exception before re-raising
+                trace_logger.error(f"Error in sentinel step execution: {e}")
+                raise
